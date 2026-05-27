@@ -548,15 +548,12 @@ def _run_img2img(
         # model refines them according to the prompt.
 
         # Add noise proportional to strength
-        scheduler.set_timesteps(steps)
+        # FlowMatch schedulers use linear interpolation, not add_noise:
+        #   noised_latents = (1 - sigma) * latents + sigma * noise
+        # where sigma = strength (0=full preservation, 1=full replacement)
         noise = _torch.randn_like(latents)
-        start_timestep = int((1.0 - strength) * steps)
-        if start_timestep <= 0:
-            start_timestep = 1
-        if start_timestep >= steps:
-            start_timestep = steps - 1
-        t = _torch.full((1,), scheduler.timesteps[start_timestep].item(), dtype=latents.dtype, device=device)
-        noised_latents = scheduler.add_noise(latents, noise, t)
+        sigma = max(0.05, min(0.95, strength))
+        noised_latents = (1.0 - sigma) * latents + sigma * noise
 
         output = flux_pipe(
             prompt=prompt,
