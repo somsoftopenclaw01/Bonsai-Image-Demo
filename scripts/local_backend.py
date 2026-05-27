@@ -508,7 +508,7 @@ def _run_img2img(
     with _torch.no_grad():
         # VAE encode
         encoded = vae.encode(img_tensor)
-        latents = encoded.latent_dist.sample() * vae.config.scaling_factor
+        latents = encoded.latent_dist.sample() * vae.config["scaling_factor"]
 
         # When strength < 1.0, we need to add noise at a specific timestep.
         # For FLUX flow-matching: noise is a random normal tensor, and the
