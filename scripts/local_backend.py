@@ -508,7 +508,13 @@ def _run_img2img(
     with _torch.no_grad():
         # VAE encode
         encoded = vae.encode(img_tensor)
-        latents = encoded.latent_dist.sample() * vae.config["scaling_factor"]
+        latents = encoded.latent_dist.sample()
+        # Apply scaling_factor if it exists in the VAE config
+        try:
+            sf = vae.config["scaling_factor"]
+            latents = latents * sf
+        except (KeyError, TypeError, AttributeError):
+            pass
 
         # When strength < 1.0, we need to add noise at a specific timestep.
         # For FLUX flow-matching: noise is a random normal tensor, and the
@@ -522,11 +528,15 @@ def _run_img2img(
         # model refines them according to the prompt.
 
         # Add noise proportional to strength
+        scheduler.set_timesteps(steps)
         noise = _torch.randn_like(latents)
-        timestep = int((1.0 - strength) * steps)
-        if timestep <= 0:
-            timestep = 1
-        noised_latents = scheduler.add_noise(latents, noise, _torch.tensor([scheduler.timesteps[timestep]]).to(device))
+        start_timestep = int((1.0 - strength) * steps)
+        if start_timestep <= 0:
+            start_timestep = 1
+        if start_timestep >= steps:
+            start_timestep = steps - 1
+        t = _torch.full((1,), scheduler.timesteps[start_timestep].item(), dtype=latents.dtype, device=device)
+        noised_latents = scheduler.add_noise(latents, noise, t)
 
         output = flux_pipe(
             prompt=prompt,
