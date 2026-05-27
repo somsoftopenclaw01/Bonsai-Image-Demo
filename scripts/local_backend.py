@@ -456,14 +456,18 @@ def _run_img2img(
     steps: int = 4,
     guidance: float = 3.5,
 ) -> bytes:
-    """Build a FluxImg2ImgPipeline from GpuPipeline components and run inference.
+    """Transform a room photo while preserving the original layout.
 
-    ACCESSES PRIVATE ATTRIBUTES: pipe._vae, pipe._transformer, etc.
-    These are set by GpuPipeline.load_artifacts() / ensure_backend().
+    Instead of building FluxImg2ImgPipeline (which needs a CLIP text encoder
+    that GpuPipeline doesn't load), we VAE-encode the input image and pass
+    the latents directly to the standard FluxPipeline with the prompt.
+    The flow-matching model refines the encoded latents according to the
+    prompt, preserving the original layout while changing materials/colors.
     """
     from diffusers import FluxTransformer2DModel
-    from diffusers.pipelines.flux.pipeline_flux_img2img import FluxImg2ImgPipeline
+    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
     from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+    import torch.nn.functional as F
 
     device = pipe.device
     dtype = _torch.bfloat16
@@ -473,24 +477,13 @@ def _run_img2img(
     text_encoder = pipe._text_encoder
     tokenizer = pipe._tokenizer
     transformer = pipe._transformer
-    original_scheduler = pipe._scheduler
 
-    # FluxImg2ImgPipeline expects these exact component types. We need:
-    # - tokenizer (CLIPTokenizer) and tokenizer_2 (T5TokenizerFast)
-    # - text_encoder (CLIPTextModel) and text_encoder_2 (T5EncoderModel)
-    #
-    # Bonsai's GpuPipeline stores a SINGLE text_encoder (T5) and tokenizer.
-    # For FluxImg2ImgPipeline we pass the T5 as text_encoder_2/tokenizer_2
-    # and leave text_encoder/tokenizer as None (FLUX mode only uses T5).
+    # Build a standard Flux pipeline from the existing components.
+    # FLUX uses only the T5 text_encoder (stored as pipe._text_encoder) and
+    # its tokenizer (pipe._tokenizer). CLIP text_encoder is not needed.
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=1.0)
 
-    # Build a new scheduler for img2img (flow-matching with timestep shift)
-    scheduler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=1000,
-        shift=1.0,
-    )
-
-    # Build the img2img pipeline
-    img2img_pipe = FluxImg2ImgPipeline(
+    flux_pipe = FluxPipeline(
         scheduler=scheduler,
         text_encoder=None,
         tokenizer=None,
@@ -499,25 +492,48 @@ def _run_img2img(
         vae=vae,
         transformer=transformer,
     )
-    img2img_pipe.to(device=device, dtype=dtype)
-    img2img_pipe.enable_model_cpu_offload()
+    flux_pipe.to(device=device, dtype=dtype)
+    flux_pipe.enable_model_cpu_offload()
 
     _img2img_log.info(
-        "img2img: prompt=%r, strength=%.2f, steps=%d",
-        prompt, strength, steps,
+        "img2img: prompt=%r, strength=%.2f, steps=%d, size=%dx%d",
+        prompt, strength, steps, input_image.width, input_image.height,
     )
 
-    # ── Run inference ──
-    generator = _torch.manual_seed(seed)
+    # ── VAE-encode the input image ──
+    # Convert PIL to tensor, normalize, move to device
+    img_np = _np.array(input_image).astype(_np.float32) / 127.5 - 1.0
+    img_tensor = _torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device, dtype)
 
     with _torch.no_grad():
-        output = img2img_pipe(
+        # VAE encode
+        encoded = vae.encode(img_tensor)
+        latents = encoded.latent_dist.sample() * vae.config.scaling_factor
+
+        # When strength < 1.0, we need to add noise at a specific timestep.
+        # For FLUX flow-matching: noise is a random normal tensor, and the
+        # timestep range [0, 1] maps to 0..num_inference_steps.
+        # strength=0.55 means we start at timestep int(0.55 * steps).
+        # We use the pipeline's internal flow-matching logic by passing
+        # the latents as the starting point.
+        #
+        # FluxPipeline accepts `latents` parameter — if provided, these are
+        # used instead of random. Combined with `num_inference_steps`, the
+        # model refines them according to the prompt.
+
+        # Add noise proportional to strength
+        noise = _torch.randn_like(latents)
+        timestep = int((1.0 - strength) * steps)
+        if timestep <= 0:
+            timestep = 1
+        noised_latents = scheduler.add_noise(latents, noise, _torch.tensor([scheduler.timesteps[timestep]]).to(device))
+
+        output = flux_pipe(
             prompt=prompt,
-            image=input_image,
-            strength=strength,
+            latents=noised_latents,
             num_inference_steps=steps,
-            generator=generator,
             guidance_scale=guidance,
+            generator=_torch.manual_seed(seed),
             output_type="pil",
         )
 
