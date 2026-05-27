@@ -350,9 +350,9 @@ if (-not $FrontendOnly) {
     $env:PYTHONUTF8       = '1'
 
     if ($uvicornExe -eq $venvPy) {
-        $backendArgs = @('-m','uvicorn','scripts.local_backend:app','--port',$BackendPort)
+        $backendArgs = @('-m','uvicorn','scripts.local_backend:app','--host','0.0.0.0','--port',$BackendPort)
     } else {
-        $backendArgs = @('scripts.local_backend:app','--port',$BackendPort)
+        $backendArgs = @('scripts.local_backend:app','--host','0.0.0.0','--port',$BackendPort)
     }
 
     $backendProcess = Start-Process `
