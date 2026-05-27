@@ -470,16 +470,17 @@ def _run_img2img(
     import torch.nn.functional as F
 
     device = pipe.device
-    # Use the transformer's actual dtype — GpuPipeline loads quantized
-    # weights (gemlite/hqq) which may be fp16, not bf16.
-    dtype = next(transformer.parameters()).dtype
-    _img2img_log.info("transformer dtype: %s, device: %s", dtype, device)
 
     # ── Extract components from the loaded GpuPipeline ──
     vae = pipe._vae
     text_encoder = pipe._text_encoder
     tokenizer = pipe._tokenizer
     transformer = pipe._transformer
+
+    # Use the transformer's actual dtype — GpuPipeline loads quantized
+    # weights (gemlite/hqq) which may be fp16, not bf16.
+    dtype = next(transformer.parameters()).dtype
+    _img2img_log.info("transformer dtype: %s, device: %s", dtype, device)
 
     # Build a standard Flux pipeline from the existing components.
     # FLUX uses only the T5 text_encoder (stored as pipe._text_encoder) and
