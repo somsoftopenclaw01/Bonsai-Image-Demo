@@ -509,12 +509,32 @@ def _run_img2img(
         # VAE encode
         encoded = vae.encode(img_tensor)
         latents = encoded.latent_dist.sample()
-        # Apply scaling_factor if it exists in the VAE config
+        # Log VAE config info for debugging
+        _img2img_log.info("VAE config keys: %s", list(vae.config.keys()))
+
+        # Get VAE scaling factor — FLUX VAEs use different config layouts.
+        # Try multiple access patterns; fall back to FLUX default (0.0688).
         try:
-            sf = vae.config["scaling_factor"]
-            latents = latents * sf
-        except (KeyError, TypeError, AttributeError):
-            pass
+            sf = float(vae.config.get("scaling_factor", None))
+        except (TypeError, AttributeError):
+            try:
+                sf = float(getattr(vae.config, "scaling_factor", None))
+            except (TypeError, AttributeError):
+                sf = None
+        
+        if sf is None:
+            # FLUX-specific fallback based on latent_channels
+            try:
+                lc = vae.config.get("latent_channels", 16) or 16
+                # For FLUX VAE with 16 latent channels, the standard
+                # scaling factor is computed as:
+                # sf = 1.0 / sqrt(latent_channels / 2)
+                sf = 1.0 / (lc / 2.0) ** 0.5
+            except Exception:
+                sf = 0.0688  # Standard FLUX VAE scaling factor
+        
+        _img2img_log.info("VAE apply scaling_factor: %s", sf)
+        latents = latents * sf
 
         # When strength < 1.0, we need to add noise at a specific timestep.
         # For FLUX flow-matching: noise is a random normal tensor, and the
