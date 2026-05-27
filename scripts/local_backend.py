@@ -555,8 +555,24 @@ def _run_img2img(
         sigma = max(0.05, min(0.95, strength))
         noised_latents = (1.0 - sigma) * latents + sigma * noise
 
-        output = flux_pipe(
+        # Pre-compute prompt embeddings using only the T5 encoder.
+        # CLIP text encoder is intentionally None (VRAM savings), so we
+        # compute T5 embeddings directly and pass a dummy pooled embedding
+        # to bypass FluxPipeline's _get_clip_prompt_embeds.
+        prompt_embeds = flux_pipe._get_t5_prompt_embeds(
             prompt=prompt,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+            device=device,
+            dtype=dtype,
+        )
+        pooled_prompt_embeds = _torch.zeros(
+            (1, 768), dtype=dtype, device=device
+        )
+
+        output = flux_pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
             latents=noised_latents,
             num_inference_steps=steps,
             guidance_scale=guidance,
