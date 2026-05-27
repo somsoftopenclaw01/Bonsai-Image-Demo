@@ -470,7 +470,10 @@ def _run_img2img(
     import torch.nn.functional as F
 
     device = pipe.device
-    dtype = _torch.bfloat16
+    # Use the transformer's actual dtype — GpuPipeline loads quantized
+    # weights (gemlite/hqq) which may be fp16, not bf16.
+    dtype = next(transformer.parameters()).dtype
+    _img2img_log.info("transformer dtype: %s, device: %s", dtype, device)
 
     # ── Extract components from the loaded GpuPipeline ──
     vae = pipe._vae
@@ -492,7 +495,7 @@ def _run_img2img(
         vae=vae,
         transformer=transformer,
     )
-    flux_pipe.to(device=device, dtype=dtype)
+    flux_pipe.to(device=device)
     flux_pipe.enable_model_cpu_offload()
 
     _img2img_log.info(
