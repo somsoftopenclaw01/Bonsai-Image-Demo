@@ -515,12 +515,12 @@ async def _transform_img2img(
 
     # ── Optional: auto-detect room from image ──
     _used_prompt = prompt
+    _enhanced = False
     if auto_describe:
         _room_desc = await _describe_room(image_bytes, mime=file.content_type or "image/jpeg")
         if _room_desc:
-            # Vision returned e.g. "living room with beige walls, brown sofa"
-            # Prepend to user's prompt so the model knows what room it's working on
             _used_prompt = f"{_room_desc}, {prompt}"
+            _enhanced = True
             _img2img_log.info("enhanced prompt: %s", _used_prompt)
         else:
             _img2img_log.info("auto_describe: vision unavailable, using original prompt")
@@ -562,7 +562,9 @@ async def _transform_img2img(
             buf = _io.BytesIO()
             result_image.save(buf, format="PNG")
             result = buf.getvalue()
-        return _Response(content=result, media_type="image/png")
+        return _Response(content=result, media_type="image/png", headers=(
+            {"X-Enhanced-Prompt": _used_prompt} if _enhanced else {}
+        ))
     except Exception as exc:
         _img2img_log.exception("img2img failed")
         from fastapi import HTTPException
