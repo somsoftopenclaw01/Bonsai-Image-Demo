@@ -391,7 +391,7 @@ __all__ = ["app"]
 # and corners while changing materials, colors, and furnishings.
 
 import io as _io
-from fastapi import UploadFile as _UploadFile, File as _File, Form as _Form
+from fastapi import UploadFile as _UploadFile, File as _File, Form as _Form, HTTPException as _HTTPException
 from fastapi.responses import Response as _Response
 from PIL import Image as _PILImage
 import torch as _torch
@@ -489,7 +489,7 @@ async def _describe_room(image_bytes: bytes, mime: str = "image/jpeg") -> str | 
 @app.post("/transform/img2img")
 async def _transform_img2img(
     file: _UploadFile = _File(..., description="Room photo to transform"),
-    prompt: str = _Form(..., min_length=1, description="Renovation style description"),
+    prompt: str = _Form("", description="Style description (optional when auto_describe=true)"),
     strength: float = _Form(0.55, ge=0.1, le=0.95, description="0.1=barely change, 0.95=mostly new"),
     seed: int = _Form(0, description="Random seed for reproducibility"),
     steps: int = _Form(4, ge=1, le=50, description="Denoising steps (4=fast, 20=quality)"),
@@ -519,13 +519,18 @@ async def _transform_img2img(
     if auto_describe:
         _room_desc = await _describe_room(image_bytes, mime=file.content_type or "image/jpeg")
         if _room_desc:
-            _used_prompt = f"{_room_desc}, {prompt}"
+            if prompt:
+                _used_prompt = f"{_room_desc}, {prompt}"
+            else:
+                _used_prompt = _room_desc
             _enhanced = True
             _img2img_log.info("enhanced prompt: %s", _used_prompt)
         else:
+            if not prompt:
+                raise _HTTPException(status_code=422, detail="prompt is required when auto_describe fails or is unconfigured")
             _img2img_log.info("auto_describe: vision unavailable, using original prompt")
-
-    # ── Resize to a model-compatible resolution while preserving aspect ratio ──
+    elif not prompt:
+        raise _HTTPException(status_code=422, detail="prompt is required")
     # Bonsai works with any dimensions that are multiples of 32.
     # Scale so the longest side ≤ 1024, then snap to nearest multiple of 32.
     _max_side = 1024
@@ -567,8 +572,7 @@ async def _transform_img2img(
         ))
     except Exception as exc:
         _img2img_log.exception("img2img failed")
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise _HTTPException(status_code=500, detail=str(exc))
 
 
 def _run_img2img(
