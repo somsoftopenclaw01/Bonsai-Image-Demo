@@ -495,6 +495,14 @@ def _run_img2img(
             if _module.bias.dtype != transformer_dtype:
                 _module.bias.data = _module.bias.data.to(transformer_dtype)
 
+    # Flux2Transformer2DModel (Flux.2) doesn't accept pooled_projections
+    # that FluxPipeline (Flux.1) passes. Wrap forward to drop it.
+    _orig_forward = transformer.forward
+    def _patched_forward(*_args, **_kwargs):
+        _kwargs.pop('pooled_projections', None)
+        return _orig_forward(*_args, **_kwargs)
+    transformer.forward = _patched_forward
+
     # Build a standard Flux pipeline from the existing components.
     # FLUX uses only the T5 text_encoder (stored as pipe._text_encoder) and
     # its tokenizer (pipe._tokenizer). CLIP text_encoder is not needed.
