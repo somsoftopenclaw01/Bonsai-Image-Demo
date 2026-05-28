@@ -297,6 +297,16 @@ if (-not $FrontendOnly) {
         $uvicornExe = $venvPy
     }
 
+    # ── Load .env file for persistent config (vision API key, etc.) ──
+    $EnvFile = Join-Path $DemoDir '.env'
+    if (Test-Path $EnvFile) {
+        Get-Content $EnvFile | ForEach-Object {
+            if ($_ -match '^\s*([^#=]+)=(.*)\s*$') {
+                [Environment]::SetEnvironmentVariable($Matches[1].Trim(), $Matches[2].Trim(), 'Process')
+            }
+        }
+    }
+
     # Per-process env block so we don't permanently mutate the parent
     # shell's MFLUX_STUDIO_GPU_* vars. Start-Process inherits the current
     # session env; set on $env: just before launch, restore after.
