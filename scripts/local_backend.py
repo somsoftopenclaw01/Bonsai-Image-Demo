@@ -400,6 +400,91 @@ import logging as _logging
 
 _img2img_log = _logging.getLogger("img2img")
 
+# ── Room detection via vision API ─────────────────────────────────────
+# Sends the image to a free vision model on OpenRouter to detect room type,
+# style, and furnishings. Falls back gracefully if unconfigured or the API
+# is unreachable. Set env vars:
+#   VISION_API_KEY    — OpenRouter API key (or compatible OpenAI API)
+#   VISION_API_URL    — defaults to https://openrouter.ai/api/v1/chat/completions
+#   VISION_MODEL      — defaults to nvidia/nemotron-nano-12b-v2-vl:free
+
+_VISION_API_KEY = os.environ.get("VISION_API_KEY", "")
+_VISION_API_URL = os.environ.get(
+    "VISION_API_URL",
+    "https://openrouter.ai/api/v1/chat/completions",
+)
+_VISION_MODEL = os.environ.get(
+    "VISION_MODEL",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+)
+
+
+async def _describe_room(image_bytes: bytes, mime: str = "image/jpeg") -> str | None:
+    """Analyze a room photo via vision API and return a scene description.
+
+    Returns something like 'living room with beige walls, brown sofa,'
+    or None on failure.
+    """
+    if not _VISION_API_KEY:
+        _img2img_log.info("vision describe: VISION_API_KEY not set, skipping")
+        return None
+
+    import base64 as _b64
+    import json as _json
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import asyncio as _asyncio
+
+    _b64_img = _b64.b64encode(image_bytes).decode("utf-8")
+    _data_url = f"data:{mime};base64,{_b64_img}"
+
+    _payload = _json.dumps({
+        "model": _VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Describe this room in a single sentence. "
+                            "Start with the room type (e.g. 'living room', 'bedroom', 'kitchen', "
+                            "'office', 'dining room'). Mention wall color, floor type, key furniture, "
+                            "and overall style. Keep it under 30 words. "
+                            "Example: 'living room with beige walls, hardwood floors, brown leather sofa, modern style'"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _data_url},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 100,
+    }).encode("utf-8")
+
+    _req = _urllib.Request(
+        _VISION_API_URL,
+        data=_payload,
+        headers={
+            "Authorization": f"Bearer {_VISION_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    _ctx = _ssl.create_default_context()
+    try:
+        _resp = await _asyncio.get_event_loop().run_in_executor(
+            None, lambda: _urllib.urlopen(_req, context=_ctx, timeout=15),
+        )
+        _body = _json.loads(_resp.read().decode("utf-8"))
+        _desc = _body["choices"][0]["message"]["content"].strip().lower()
+        _img2img_log.info("vision describe: %s", _desc)
+        return _desc
+    except Exception as _exc:
+        _img2img_log.warning("vision describe failed: %s", _exc)
+        return None
+
 
 @app.post("/transform/img2img")
 async def _transform_img2img(
@@ -410,6 +495,7 @@ async def _transform_img2img(
     steps: int = _Form(4, ge=1, le=50, description="Denoising steps (4=fast, 20=quality)"),
     guidance: float = _Form(3.5, ge=0.0, le=20.0, description="Prompt adherence strength"),
     negative_prompt: str = _Form("ugly, blurry, deformed, distorted, crooked, skewed, wrong perspective, bad proportions, clutter, messy, dirty, damaged, watermark, text, low quality", description="What to avoid"),
+    auto_describe: bool = _Form(False, description="Auto-detect room type from image and enhance prompt"),
 ):
     """Transform a room photo while preserving the original layout.
 
@@ -417,11 +503,27 @@ async def _transform_img2img(
     determined by `strength`, and the denoising loop runs from that point.
     Walls, windows, and corners inherited from the original latents stay
     intact; materials, colors, and furnishings are regenerated.
+
+    When `auto_describe=True`, the image is first analyzed by a vision model
+    to detect the room type and style, which is prepended to your prompt
+    automatically. Requires VISION_API_KEY env var.
     """
     pipe = app.state.pipeline
     image_bytes = await file.read()
     input_image = _PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
     orig_width, orig_height = input_image.size
+
+    # ── Optional: auto-detect room from image ──
+    _used_prompt = prompt
+    if auto_describe:
+        _room_desc = await _describe_room(image_bytes, mime=file.content_type or "image/jpeg")
+        if _room_desc:
+            # Vision returned e.g. "living room with beige walls, brown sofa"
+            # Prepend to user's prompt so the model knows what room it's working on
+            _used_prompt = f"{_room_desc}, {prompt}"
+            _img2img_log.info("enhanced prompt: %s", _used_prompt)
+        else:
+            _img2img_log.info("auto_describe: vision unavailable, using original prompt")
 
     # ── Resize to a model-compatible resolution while preserving aspect ratio ──
     # Bonsai works with any dimensions that are multiples of 32.
@@ -447,7 +549,7 @@ async def _transform_img2img(
         result = _run_img2img(
             pipe=pipe,
             input_image=input_image,
-            prompt=prompt,
+            prompt=_used_prompt,
             strength=strength,
             seed=seed,
             steps=steps,
