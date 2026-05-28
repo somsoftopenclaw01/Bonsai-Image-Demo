@@ -458,157 +458,174 @@ def _run_img2img(
 ) -> bytes:
     """Transform a room photo while preserving the original layout.
 
-    Instead of building FluxImg2ImgPipeline (which needs a CLIP text encoder
-    that GpuPipeline doesn't load), we VAE-encode the input image and pass
-    the latents directly to the standard FluxPipeline with the prompt.
-    The flow-matching model refines the encoded latents according to the
-    prompt, preserving the original layout while changing materials/colors.
+    Uses the Flux.2 pipeline path from diffusion_klein.py adapted for img2img:
+    VAE-encode → patchify → BN-normalize → pack → add noise → denoise →
+    unpack → BN-denormalize → unpatchify → VAE-decode.
+
+    Qwen3 text encoding stacks hidden states from layers 9, 18, 27.
+    Uses empirical-mu timestep scheduling for proper Flux.2 noise schedule.
     """
-    from diffusers import FluxTransformer2DModel
-    from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+    import io as _io
+    import numpy as _np
+    import torch as _torch
+    from diffusers import Flux2Pipeline
+    from diffusers.pipelines.flux2.pipeline_flux2 import retrieve_timesteps
     from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-    import torch.nn.functional as F
 
     device = pipe.device
-
-    # ── Extract components from the loaded GpuPipeline ──
     vae = pipe._vae
     text_encoder = pipe._text_encoder
     tokenizer = pipe._tokenizer
     transformer = pipe._transformer
 
-    # Determine per-component dtypes — GpuPipeline loads quantized
-    # weights (gemlite/hqq) which may be fp16, not bf16.
-    # VAE and text_encoder may have different dtypes; use each component's
-    # corresponding dtype when feeding it.
+    transformer_device = next(transformer.parameters()).device
+    vae_device = next(vae.parameters()).device
     transformer_dtype = next(transformer.parameters()).dtype
     vae_dtype = next(vae.parameters()).dtype
     _img2img_log.info("transformer dtype: %s, vae dtype: %s, device: %s",
                        transformer_dtype, vae_dtype, device)
 
-    # Fix gemlite bias dtype mismatches — gemlite stores weights in a packed
-    # format (fp16-compatible activations), but biases from the checkpoint
-    # may be bf16, causing c10::Half vs c10::BFloat16 errors.
+    # Fix gemlite bias dtype mismatches
     from gemlite.core import GemLiteLinearTriton
     for _module in transformer.modules():
         if isinstance(_module, GemLiteLinearTriton) and _module.bias is not None:
             if _module.bias.dtype != transformer_dtype:
                 _module.bias.data = _module.bias.data.to(transformer_dtype)
 
-    # Flux2Transformer2DModel (Flux.2) doesn't accept pooled_projections
-    # that FluxPipeline (Flux.1) passes. Wrap forward to drop it.
-    _orig_forward = transformer.forward
-    def _patched_forward(*_args, **_kwargs):
-        _kwargs.pop('pooled_projections', None)
-        return _orig_forward(*_args, **_kwargs)
-    transformer.forward = _patched_forward
+    # ── 1. Text encode (Qwen3, stack layers 9/18/27) ──
+    _Q3_LAYERS = (9, 18, 27)
+    _max_seq = 512
 
-    # Build a standard Flux pipeline from the existing components.
-    # FLUX uses only the T5 text_encoder (stored as pipe._text_encoder) and
-    # its tokenizer (pipe._tokenizer). CLIP text_encoder is not needed.
-    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=1.0)
+    _text = prompt
+    if hasattr(tokenizer, 'apply_chat_template'):
+        _text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        )
+    if not isinstance(_text, str):
+        _text = prompt
 
-    flux_pipe = FluxPipeline(
-        scheduler=scheduler,
-        text_encoder=None,
-        tokenizer=None,
-        text_encoder_2=text_encoder,
-        tokenizer_2=tokenizer,
-        vae=vae,
-        transformer=transformer,
+    _inputs = tokenizer(
+        _text, return_tensors="pt", padding="max_length", truncation=True,
+        max_length=_max_seq,
     )
-    flux_pipe.to(device=device)
-    flux_pipe.enable_model_cpu_offload()
+    _input_ids = _inputs["input_ids"].to(device)
+    _attn_mask = _inputs["attention_mask"].to(device) if "attention_mask" in _inputs else None
 
-    _img2img_log.info(
-        "img2img: prompt=%r, strength=%.2f, steps=%d, size=%dx%d",
-        prompt, strength, steps, input_image.width, input_image.height,
+    _output = text_encoder(
+        input_ids=_input_ids, attention_mask=_attn_mask,
+        output_hidden_states=True, use_cache=False,
     )
+    _stacked = _torch.stack([_output.hidden_states[k] for k in _Q3_LAYERS], dim=1)
+    _b, _c, _s, _hd = _stacked.shape
+    prompt_embeds = _stacked.permute(0, 2, 1, 3).reshape(_b, _s, _c * _hd)
 
-    # ── VAE-encode the input image ──
-    # Convert PIL to tensor, normalize, move to device
-    img_np = _np.array(input_image).astype(_np.float32) / 127.5 - 1.0
-    # Cast input to VAE's dtype (may differ from transformer's)
-    img_tensor = _torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device, vae_dtype)
+    text_ids = Flux2Pipeline._prepare_text_ids(prompt_embeds).to(transformer_device)
+    prompt_embeds_t = prompt_embeds.to(device=transformer_device, dtype=transformer_dtype)
+
+    # ── 2. VAE-encode input image → patchify → BN-normalize → pack ──
+    height, width = input_image.height, input_image.width
+    _img_np = _np.array(input_image).astype(_np.float32) / 127.5 - 1.0
+    _img_t = _torch.from_numpy(_img_np).permute(2, 0, 1).unsqueeze(0).to(device, vae_dtype)
 
     with _torch.no_grad():
-        # VAE encode
-        encoded = vae.encode(img_tensor)
-        latents = encoded.latent_dist.sample()
-        # Log VAE config info for debugging
-        _img2img_log.info("VAE config keys: %s", list(vae.config.keys()))
+        _encoded = vae.encode(_img_t)
+        latents_4d = _encoded.latent_dist.sample()  # (1, 32, H/8, W/8)
 
-        # Get VAE scaling factor — FLUX VAEs use different config layouts.
-        # Try multiple access patterns; fall back to FLUX default (0.0688).
-        try:
-            sf = float(vae.config.get("scaling_factor", None))
-        except (TypeError, AttributeError):
-            try:
-                sf = float(getattr(vae.config, "scaling_factor", None))
-            except (TypeError, AttributeError):
-                sf = None
-        
-        if sf is None:
-            # FLUX-specific fallback based on latent_channels
-            try:
-                lc = vae.config.get("latent_channels", 16) or 16
-                # For FLUX VAE with 16 latent channels, the standard
-                # scaling factor is computed as:
-                # sf = 1.0 / sqrt(latent_channels / 2)
-                sf = 1.0 / (lc / 2.0) ** 0.5
-            except Exception:
-                sf = 0.0688  # Standard FLUX VAE scaling factor
-        
-        _img2img_log.info("VAE apply scaling_factor: %s", sf)
-        latents = latents * sf
-        # Cast latents to transformer dtype for the denoising loop
-        latents = latents.to(transformer_dtype)
+        # Patchify: 32ch @ H/8 → 128ch @ H/16 (transformer latent space)
+        latents_4d = Flux2Pipeline._patchify_latents(latents_4d)  # (1, 128, H/16, W/16)
 
-        # When strength < 1.0, we need to add noise at a specific timestep.
-        # For FLUX flow-matching: noise is a random normal tensor, and the
-        # timestep range [0, 1] maps to 0..num_inference_steps.
-        # strength=0.55 means we start at timestep int(0.55 * steps).
-        # We use the pipeline's internal flow-matching logic by passing
-        # the latents as the starting point.
-        #
-        # FluxPipeline accepts `latents` parameter — if provided, these are
-        # used instead of random. Combined with `num_inference_steps`, the
-        # model refines them according to the prompt.
+        # BN normalize to transformer space
+        _bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents_4d.device, latents_4d.dtype)
+        _bn_eps = _torch.tensor(vae.config.batch_norm_eps, device=latents_4d.device, dtype=latents_4d.dtype)
+        _bn_std = _torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1) + _bn_eps
+        ).to(latents_4d.device, latents_4d.dtype)
+        latents_4d = (latents_4d - _bn_mean) / _bn_std
+
+        # Pack: (1, 128, H/16, W/16) → (1, img_seq_len, 128)
+        latent_ids = Flux2Pipeline._prepare_latent_ids(latents_4d).to(transformer_device)
+        latents = Flux2Pipeline._pack_latents(
+            latents_4d.to(device=transformer_device, dtype=transformer_dtype)
+        )
 
         # Add noise proportional to strength
-        # FlowMatch schedulers use linear interpolation, not add_noise:
-        #   noised_latents = (1 - sigma) * latents + sigma * noise
-        # where sigma = strength (0=full preservation, 1=full replacement)
-        noise = _torch.randn_like(latents)
+        _noise = _torch.randn_like(latents)
         sigma = max(0.05, min(0.95, strength))
-        noised_latents = (1.0 - sigma) * latents + sigma * noise
+        noised_latents = (1.0 - sigma) * latents + sigma * _noise
 
-        # Pre-compute prompt embeddings using only the T5 encoder.
-        # CLIP text encoder is intentionally None (VRAM savings), so we
-        # compute T5 embeddings directly and pass a dummy pooled embedding
-        # to bypass FluxPipeline's _get_clip_prompt_embeds.
-        prompt_embeds = flux_pipe._get_t5_prompt_embeds(
-            prompt=prompt,
-            num_images_per_prompt=1,
-            max_sequence_length=512,
-            device=device,
-            dtype=transformer_dtype,
-        )
-        pooled_prompt_embeds = _torch.zeros(
-            (1, 768), dtype=transformer_dtype, device=device
-        )
+        image_seq_len = noised_latents.shape[1]
 
-        output = flux_pipe(
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            latents=noised_latents,
-            num_inference_steps=steps,
-            guidance_scale=guidance,
-            generator=_torch.manual_seed(seed),
-            output_type="pil",
-        )
+        # ── 3. Schedule timesteps with empirical mu (Flux.2 style) ──
+        def _mu(img_seq, n_steps):
+            a1, b1 = 8.73809524e-05, 1.89833333
+            a2, b2 = 0.00016927, 0.45666666
+            if img_seq > 4300:
+                return float(a2 * img_seq + b2)
+            m_200 = a2 * img_seq + b2
+            m_10 = a1 * img_seq + b1
+            a = (m_200 - m_10) / 190.0
+            b = m_200 - 200.0 * a
+            return float(a * n_steps + b)
 
-    result_image = output.images[0]
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=1000, shift=3.0, use_dynamic_shifting=True,
+            base_shift=0.5, max_shift=1.15,
+            base_image_seq_len=256, max_image_seq_len=4096,
+        )
+        mu = _mu(image_seq_len, steps)
+        _sigmas = _np.linspace(1.0, 1.0 / steps, steps)
+        timesteps, num_steps_eff = retrieve_timesteps(
+            scheduler, steps, transformer_device, sigmas=_sigmas, mu=mu,
+        )
+        _img2img_log.info("scheduling: num_steps=%d mu=%.4f img_seq=%d",
+                           num_steps_eff, mu, image_seq_len)
+
+        guidance_t = _torch.full([1], guidance, device=transformer_device, dtype=_torch.float32)
+        guidance_t = guidance_t.expand(noised_latents.shape[0])
+
+        # ── 4. Denoising loop (single forward, no CFG) ──
+        latents = noised_latents
+        for i, t in enumerate(timesteps):
+            _ts = t.expand(latents.shape[0]).to(latents.dtype)
+
+            noise_pred = transformer(
+                hidden_states=latents,
+                timestep=_ts / 1000,
+                guidance=guidance_t,
+                encoder_hidden_states=prompt_embeds_t,
+                txt_ids=text_ids,
+                img_ids=latent_ids,
+                return_dict=False,
+            )[0]
+
+            _ldtype = latents.dtype
+            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            if latents.dtype != _ldtype:
+                latents = latents.to(_ldtype)
+
+        # ── 5. Unpack → BN denormalize → unpatchify → VAE decode ──
+        latents = Flux2Pipeline._unpack_latents_with_ids(latents, latent_ids)
+        latents = latents.to(device=vae_device, dtype=vae_dtype)
+
+        _bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        _bn_eps = _torch.tensor(vae.config.batch_norm_eps, device=latents.device, dtype=latents.dtype)
+        _bn_std = _torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + _bn_eps).to(
+            latents.device, latents.dtype,
+        )
+        latents = latents * _bn_std + _bn_mean
+        latents = Flux2Pipeline._unpatchify_latents(latents)
+
+        _image_out = vae.decode(latents, return_dict=False)[0]
+
+    # ── 6. Tensor → PIL ──
+    _img_out = _image_out[0].clamp(-1.0, 1.0).float()
+    _img_out = (_img_out + 1.0) * 127.5
+    _img_out = _img_out.clamp(0.0, 255.0).round().to(_torch.uint8)
+    _img_out = _img_out.permute(1, 2, 0).cpu().numpy()
+
+    from PIL import Image as _PILImage
+    result_image = _PILImage.fromarray(_img_out, mode="RGB")
 
     buf = _io.BytesIO()
     result_image.save(buf, format="PNG")
