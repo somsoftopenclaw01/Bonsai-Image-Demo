@@ -421,10 +421,23 @@ async def _transform_img2img(
     pipe = app.state.pipeline
     image_bytes = await file.read()
     input_image = _PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+    orig_width, orig_height = input_image.size
 
-    # ── Resize to match Bonsai's native resolution ──
-    target_size = 1024
-    input_image = input_image.resize((target_size, target_size), _PILImage.LANCZOS)
+    # ── Resize to a model-compatible resolution while preserving aspect ratio ──
+    # Bonsai works with any dimensions that are multiples of 32.
+    # Scale so the longest side ≤ 1024, then snap to nearest multiple of 32.
+    _max_side = 1024
+    _scale = min(_max_side / orig_width, _max_side / orig_height, 1.0)
+    _target_w = int(round(orig_width * _scale / 32) * 32)
+    _target_h = int(round(orig_height * _scale / 32) * 32)
+    # Floor instead of round if the rounded-up size exceeds max_side
+    if _target_w > _max_side or _target_h > _max_side:
+        _target_w = int(orig_width * _scale / 32) * 32
+        _target_h = int(orig_height * _scale / 32) * 32
+    _target_w = max(64, _target_w)
+    _target_h = max(64, _target_h)
+    if (_target_w, _target_h) != input_image.size:
+        input_image = input_image.resize((_target_w, _target_h), _PILImage.LANCZOS)
 
     # ── Build img2img pipeline from loaded components ──
     # GpuPipeline stores components as private attrs (_vae, _transformer, etc.)
@@ -440,6 +453,13 @@ async def _transform_img2img(
             steps=steps,
             guidance=guidance,
         )
+        # Upscale result back to original dimensions if they differ
+        result_image = _PILImage.open(_io.BytesIO(result))
+        if (result_image.width, result_image.height) != (orig_width, orig_height):
+            result_image = result_image.resize((orig_width, orig_height), _PILImage.LANCZOS)
+            buf = _io.BytesIO()
+            result_image.save(buf, format="PNG")
+            result = buf.getvalue()
         return _Response(content=result, media_type="image/png")
     except Exception as exc:
         _img2img_log.exception("img2img failed")
