@@ -477,10 +477,23 @@ def _run_img2img(
     tokenizer = pipe._tokenizer
     transformer = pipe._transformer
 
-    # Use the transformer's actual dtype — GpuPipeline loads quantized
+    # Determine per-component dtypes — GpuPipeline loads quantized
     # weights (gemlite/hqq) which may be fp16, not bf16.
-    dtype = next(transformer.parameters()).dtype
-    _img2img_log.info("transformer dtype: %s, device: %s", dtype, device)
+    # VAE and text_encoder may have different dtypes; use each component's
+    # corresponding dtype when feeding it.
+    transformer_dtype = next(transformer.parameters()).dtype
+    vae_dtype = next(vae.parameters()).dtype
+    _img2img_log.info("transformer dtype: %s, vae dtype: %s, device: %s",
+                       transformer_dtype, vae_dtype, device)
+
+    # Fix gemlite bias dtype mismatches — gemlite stores weights in a packed
+    # format (fp16-compatible activations), but biases from the checkpoint
+    # may be bf16, causing c10::Half vs c10::BFloat16 errors.
+    from gemlite.core import GemLiteLinearTriton
+    for _module in transformer.modules():
+        if isinstance(_module, GemLiteLinearTriton) and _module.bias is not None:
+            if _module.bias.dtype != transformer_dtype:
+                _module.bias.data = _module.bias.data.to(transformer_dtype)
 
     # Build a standard Flux pipeline from the existing components.
     # FLUX uses only the T5 text_encoder (stored as pipe._text_encoder) and
@@ -507,7 +520,8 @@ def _run_img2img(
     # ── VAE-encode the input image ──
     # Convert PIL to tensor, normalize, move to device
     img_np = _np.array(input_image).astype(_np.float32) / 127.5 - 1.0
-    img_tensor = _torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device, dtype)
+    # Cast input to VAE's dtype (may differ from transformer's)
+    img_tensor = _torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device, vae_dtype)
 
     with _torch.no_grad():
         # VAE encode
@@ -539,6 +553,8 @@ def _run_img2img(
         
         _img2img_log.info("VAE apply scaling_factor: %s", sf)
         latents = latents * sf
+        # Cast latents to transformer dtype for the denoising loop
+        latents = latents.to(transformer_dtype)
 
         # When strength < 1.0, we need to add noise at a specific timestep.
         # For FLUX flow-matching: noise is a random normal tensor, and the
@@ -568,10 +584,10 @@ def _run_img2img(
             num_images_per_prompt=1,
             max_sequence_length=512,
             device=device,
-            dtype=dtype,
+            dtype=transformer_dtype,
         )
         pooled_prompt_embeds = _torch.zeros(
-            (1, 768), dtype=dtype, device=device
+            (1, 768), dtype=transformer_dtype, device=device
         )
 
         output = flux_pipe(
